@@ -1,0 +1,42 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/claude-notification.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/claude-notification.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "tool_permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/claude-notification.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "user_question_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/claude-notification.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
