@@ -5,12 +5,13 @@
 # WSL bash 起点で tmux セッションを作成し、
 # Windows 側の pwsh.exe で HWND 取得・デーモン起動を行う。
 #
-# 使い方: bash ~/start-wsl.sh [セッション名]
+# 使い方: bash ~/start-wsl.sh
 # 配置先: ~/start-wsl.sh (WSL ホーム)
 
 set -euo pipefail
 
-SESSION_NAME="${1:-work}"
+# --- セッション名 (peers 対応: 毎回ユニーク、start-psmux.ps1 と同等) ---
+SESSION_NAME="work-$(date +%H%M%S)"
 
 # --- WSL 環境チェック ---
 if ! grep -qi microsoft /proc/version 2>/dev/null; then

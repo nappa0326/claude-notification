@@ -17,6 +17,7 @@ claude-notification.sh (bash - 高速、~50ms)
   ├─ 環境自動検出 (psmux / WSL)
   ├─ stdin から JSON payload 読み取り (message フィールド抽出)
   ├─ tmux display-message でセッション名・ペインID 取得
+  ├─ tmux list-panes で window_index を逆引き (peers 対応)
   ├─ .last-notify.json にペイン情報を書き出し
   │    psmux: ~/.claude/hooks/.last-notify.json
   │    WSL:   /mnt/c/Users/<user>/.claude/hooks/.last-notify.json
@@ -26,8 +27,9 @@ claude-notification.sh (bash - 高速、~50ms)
   ├─ FileSystemWatcher で .last-notify.json 変更検知 → BurntToast 通知
   ├─ BurntToast OnActivated でクリック検出
   ├─ env フィールドで psmux/WSL 分岐
-  │    psmux: tmux -S <socket> select-pane
-  │    WSL:   wsl -d <distro> -- tmux -S <socket> select-pane
+  │    psmux: tmux -S <socket> select-window -t <session>:<window_index>
+  │           tmux -S <socket> select-pane -t <pane_id>
+  │    WSL:   wsl -d <distro> -- tmux -S <socket> select-window/select-pane
   └─ Win32 SetForegroundWindow で Windows Terminal をアクティブ化
 ```
 
@@ -183,7 +185,7 @@ jq -s '.[0] * .[1]' ~/.claude/settings.json /mnt/c/<リポジトリパス>/setti
 
 ```bash
 # WSL 内で (HWND 取得 + デーモン起動 + tmux セッション作成を一括実行):
-bash ~/start-wsl.sh work
+bash ~/start-wsl.sh
 ```
 
 ### 5. 動作確認
@@ -210,6 +212,16 @@ cat /mnt/c/Users/<ユーザー名>/.claude/hooks/.last-notify.json
 - BurntToast v1.0.1+ か確認 (v1.0.0 は OnActivated のバグあり)
 - デーモンログを確認: `cat ~/.claude/hooks/focus-listener-daemon.log`
 
+### peers 環境: クリック後に別ピアのタブへ切り替わらない
+- デーモンログで `[CLICK] select-window=` の値が `<session>:<数値>` 形式か確認
+- 空や `@N` 形式なら window_index の取得に失敗している
+- `.last-notify.json` に `window_index` フィールドがあるか確認
+- hook を手動実行して出力を確認 (該当ピア shell 内で実行):
+  ```bash
+  tmux list-panes -s -t "$(tmux display-message -p '#{session_name}')" \
+      -F '#{pane_id} #{window_index}'
+  ```
+
 ### psmux でセッション名/ペインIDが取れない
 - psmux セッション内で `echo $TMUX` が非空か確認
 - `tmux display-message -p '#{session_name}:#{pane_id}'` が動くか確認
@@ -227,6 +239,28 @@ cat /mnt/c/Users/<ユーザー名>/.claude/hooks/.last-notify.json
 ### Windows Terminal がフォアグラウンドに来ない
 - `SetForegroundWindow` はフォーカス制限がある
   (通知クリック経由なので通常は問題ないが、グループポリシー等で制限される場合あり)
+
+## peers 環境対応
+
+[claude-peers](https://github.com/nappa0326/claude-peers) のように各ピアが独立した
+psmux window (`peer-0`, `peer-1`...) として並ぶ環境では、`select-pane` だけでは
+window が切り替わらない。本ツールは以下の方式で対応:
+
+- **hook 側**: `tmux list-panes -s -t <session> -F '#{pane_id} #{window_index}'` で
+  自 pane_id に対応する window_index を逆引きし、JSON に保存
+- **daemon 側**: `select-window -t <session>:<window_index>` → `select-pane -t <pane_id>`
+  の順で両方実行
+
+### psmux の非互換挙動 (回避済み)
+
+実装にあたり以下の非互換を確認済み。同種の問題で悩んだ場合の参考に:
+
+- `display-message -p '#{window_id}'` は client の active pane に依存するため、
+  inactive な window で動く hook から自 window_id を取得できない
+- `display-message -t <pane_id>` は `-t` を無視して current window を返す
+- `select-window -t @N` (window_id 形式) は受け付けず、数値 index として誤解釈される
+- `select-window -t <session>:<window_name>` は無視される
+- 確実に動くのは `select-window -t <session>:<window_index>` (数値 index) のみ
 
 ## 既知の制限事項
 
