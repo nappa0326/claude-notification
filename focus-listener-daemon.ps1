@@ -117,15 +117,29 @@ public class WinFocus {
             $envType = if ($info.env) { $info.env } else { "psmux" }
 
             if ($paneId -and $socket) {
+                # peers 環境では各ピアが独立した psmux window として並ぶため、
+                # select-pane だけでは window が切り替わらない。
+                # psmux は select-window -t @N (window_id形式) を受け付けない
+                # (数値 index として誤解釈) ため、"session_name:window_index" 形式で指定する。
+                $windowIndex = if ($info.window_index) { "$($info.window_index)".Trim() } else { "" }
+                $sessionName = if ($info.session_name) { "$($info.session_name)".Trim() } else { "" }
+                $winTarget = if ($sessionName -and $windowIndex) { "${sessionName}:${windowIndex}" } else { "" }
+
                 if ($envType -eq "wsl" -and $info.wsl_distro) {
-                    # WSL: wsl -d <distro> -- tmux -S <socket> select-pane -t <pane_id>
+                    # WSL: session:index で select-window してから select-pane
+                    if ($winTarget) {
+                        & wsl -d $info.wsl_distro -- tmux -S $socket select-window -t $winTarget 2>&1 | Out-Null
+                    }
                     $r = & wsl -d $info.wsl_distro -- tmux -S $socket select-pane -t $paneId 2>&1
-                    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] WSL select-pane=$paneId distro=$($info.wsl_distro) socket=$socket exit=$LASTEXITCODE" |
+                    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] WSL select-window=$winTarget pane=$paneId distro=$($info.wsl_distro) socket=$socket exit=$LASTEXITCODE" |
                         Out-File $logPath -Append -Encoding utf8
                 } else {
-                    # psmux: 直接 tmux コマンド
+                    # psmux: session:index で select-window してから select-pane
+                    if ($winTarget) {
+                        & tmux -S $socket select-window -t $winTarget 2>&1 | Out-Null
+                    }
                     $r = & tmux -S $socket select-pane -t $paneId 2>&1
-                    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] select-pane=$paneId socket=$socket exit=$LASTEXITCODE" |
+                    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] select-window=$winTarget pane=$paneId socket=$socket exit=$LASTEXITCODE" |
                         Out-File $logPath -Append -Encoding utf8
                 }
             } elseif ($paneId) {

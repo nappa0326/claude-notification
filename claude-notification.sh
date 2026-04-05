@@ -62,9 +62,10 @@ if [ -n "$CWD" ]; then
     PROJECT_NAME=$(basename "$CWD")
 fi
 
-# --- psmux (tmux互換) からセッション名・ペインIDを取得 ---
+# --- psmux (tmux互換) からセッション名・ペイン/ウィンドウ情報を取得 ---
 SESSION_NAME=""
 PANE_ID=""
+WINDOW_INDEX=""
 
 # $TMUX_PANE が設定されていればそれを使う (psmux がセットする場合)
 if [ -n "${TMUX_PANE:-}" ]; then
@@ -78,6 +79,16 @@ if command -v tmux &>/dev/null && [ -n "${TMUX:-}" ]; then
     fi
     if [ -z "$PANE_ID" ]; then
         PANE_ID=$(tmux display-message -p '#{pane_id}' 2>/dev/null || echo "")
+    fi
+    # window_index 逆引き (peers 対応: 各ピアが独立した window として並ぶ環境で必須)
+    # psmux 互換性注意:
+    #   - display-message は client の active pane に依存するため inactive 側から取れない
+    #   - display-message -t は -t を無視する非互換あり
+    #   - select-window は @N (window_id) 形式を受け付けない (index として誤解釈)
+    #   → list-panes で全pane列挙 → pane_id 一致行から window_index (数値) を取得
+    #   → daemon は "session:window_index" 形式で select-window する
+    if [ -n "$SESSION_NAME" ] && [ -n "$PANE_ID" ]; then
+        WINDOW_INDEX=$(tmux list-panes -s -t "$SESSION_NAME" -F '#{pane_id} #{window_index}' 2>/dev/null | awk -v p="$PANE_ID" '$1 == p {print $2}' | head -1)
     fi
 fi
 
@@ -157,6 +168,7 @@ cat > "$NOTIFY_FILE" <<EOF
 {
     "session_name": "$SESSION_NAME",
     "pane_id": "$PANE_ID",
+    "window_index": "$WINDOW_INDEX",
     "project": "$PROJECT_NAME",
     "subtitle": "$SUBTITLE",
     "tag": "$TAG",
