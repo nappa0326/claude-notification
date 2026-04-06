@@ -10,9 +10,10 @@
 # 設計:
 #   - hook command は bash で高速実行 (~50ms)
 #   - psmux/WSL 両環境対応: 環境自動検出で書き出し先・パスを分岐
-#   - psmux: ローカル ~/.claude/hooks/.last-notify.json に書き出し
-#   - WSL: /mnt/c/Users/<user>/.claude/hooks/.last-notify.json に書き出し
-#   - 常駐デーモン (focus-listener-daemon.ps1) が FSW で検知し通知発行
+#   - psmux: ローカル ~/.claude/hooks/notify-queue/<uuid>.json に書き出し
+#   - WSL: /mnt/c/Users/<user>/.claude/hooks/notify-queue/<uuid>.json に書き出し
+#   - 常駐デーモン (focus-listener-daemon.ps1) が FSW Created で検知し通知発行
+#   - 1通知=1ファイルのキューモデルで同時通知の race condition を解消
 
 set -euo pipefail
 
@@ -142,15 +143,19 @@ fi
 # --- UniqueIdentifier (英数字とハイフンのみ) ---
 TAG=$(echo "cc-${SESSION_NAME}-${PANE_ID}" | tr -cd 'a-zA-Z0-9-')
 
-# --- ペイン情報をファイルに書き出し (常駐デーモンが FSW で検知) ---
+# --- ペイン情報をキューディレクトリに書き出し (1通知=1ファイル、デーモンが FSW Created で検知) ---
 if [ "$ENV_TYPE" = "wsl" ]; then
     # WSL: Windows 側のパスに書き出し (FSW が検知できるよう /mnt/c/ 経由)
-    NOTIFY_DIR="$WIN_HOOKS_DIR"
+    QUEUE_DIR="$WIN_HOOKS_DIR/notify-queue"
 else
-    NOTIFY_DIR="$HOME/.claude/hooks"
+    QUEUE_DIR="$HOME/.claude/hooks/notify-queue"
 fi
-NOTIFY_FILE="$NOTIFY_DIR/.last-notify.json"
-mkdir -p "$NOTIFY_DIR"
+mkdir -p "$QUEUE_DIR"
+
+# ユニークファイル名 (timestamp ms精度 + random で衝突回避)
+NOTIFY_TS=$(date -u +%Y%m%dT%H%M%S%3N)
+NOTIFY_RND=$(printf "%04x" $((RANDOM & 0xFFFF)))
+NOTIFY_FILE="$QUEUE_DIR/${NOTIFY_TS}-${NOTIFY_RND}.json"
 
 # WSL 時は env, wsl_distro フィールドを追加
 WSL_FIELDS=""
@@ -179,5 +184,6 @@ $WSL_FIELDS
 }
 EOF
 
-# 通知発行は常駐デーモン (focus-listener-daemon.ps1) が FSW 経由で行う
+# 通知発行は常駐デーモン (focus-listener-daemon.ps1) が FSW Created 経由で行う
+# デーモンはファイル読み取り後に削除する
 exit 0

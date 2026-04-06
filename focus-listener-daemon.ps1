@@ -4,11 +4,14 @@
     BurntToast 通知発行 + クリック → psmux/WSL ペインフォーカス 常駐デーモン
 .DESCRIPTION
     psmux/WSL 両環境に対応し、以下を一貫して処理する:
-      1. FileSystemWatcher で .last-notify.json の変更を検知
-      2. BurntToast でトースト通知を発行
-      3. OnActivated でクリックを検出し、psmux/WSL ペインにフォーカス
+      1. FileSystemWatcher で notify-queue/ ディレクトリの新規ファイルを検知
+      2. ToastContentBuilder で launch 引数にペイン情報を埋め込んだトースト通知を発行
+      3. OnActivated で launch 引数をパースし、psmux/WSL ペインにフォーカス
 
-    環境判定: .last-notify.json の "env" フィールドで分岐
+    1通知=1ファイルのキューモデルにより、同時通知の race condition を解消。
+    クリック時はファイル読み込み不要 (launch 引数から直接ペイン情報を取得)。
+
+    環境判定: launch 引数の "env" キーで分岐
       - "psmux" (or 未設定): tmux -S <socket> select-pane
       - "wsl": wsl -d <distro> -- tmux -S <socket> select-pane
 
@@ -93,45 +96,53 @@ public class WinFocus {
     $hasIcon = Test-Path $iconPath
     if ($hasIcon) { Log "Icon: $iconPath" }
 
-    # --- OnActivated: クリック → ペインフォーカス + WT アクティブ化 ---
+    # --- OnActivated: クリック → launch 引数パース → ペインフォーカス + WT アクティブ化 ---
     # 注意: Register-ObjectEvent は1回のみ。再登録すると OnActivated が壊れる
+    # OnActivated は非標準1引数デリゲートのため $Event.SourceEventArgs は null になる。
+    # $args[0] (= $Event.SourceArgs[0]) から ToastNotificationActivatedEventArgsCompat を取得する。
     $CompatMgr = [Microsoft.Toolkit.Uwp.Notifications.ToastNotificationManagerCompat]
 
     $null = Register-ObjectEvent -InputObject $CompatMgr -EventName OnActivated `
         -SourceIdentifier "CCFocusDaemon_OnActivated" -Action {
 
         $logPath = Join-Path $HOME ".claude" "hooks" "focus-listener-daemon.log"
-        $notifyFile = Join-Path $HOME ".claude" "hooks" ".last-notify.json"
 
         try {
-            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] OnActivated fired" |
+            # --- launch 引数パース (ファイル読み込み不要、race condition なし) ---
+            $eventArgs = $args[0]
+            if (-not $eventArgs) { $eventArgs = $Event.SourceArgs[0] }
+            $argString = $eventArgs.Argument
+
+            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] OnActivated fired, args='$argString'" |
                 Out-File $logPath -Append -Encoding utf8
 
-            if (-not (Test-Path $notifyFile)) { return }
-            $info = Get-Content $notifyFile -Raw -ErrorAction Stop | ConvertFrom-Json
-            if (-not $info) { return }
+            if (-not $argString) { return }
+
+            # ToastArguments.Parse で URL デコード付きパース (% → %25 自動変換に対応)
+            $parsed = [Microsoft.Toolkit.Uwp.Notifications.ToastArguments]::Parse($argString)
+            $paneId = $parsed["pane_id"]
+            $socket = $parsed["tmux_socket"]
+            $envType = if ($parsed.Contains("env")) { $parsed["env"] } else { "psmux" }
+            $windowIndex = if ($parsed.Contains("window_index")) { $parsed["window_index"] } else { "" }
+            $sessionName = if ($parsed.Contains("session_name")) { $parsed["session_name"] } else { "" }
+            $wslDistro = if ($parsed.Contains("wsl_distro")) { $parsed["wsl_distro"] } else { "" }
+            $wtHwnd = if ($parsed.Contains("wt_hwnd")) { $parsed["wt_hwnd"] } else { "" }
 
             # --- ペインフォーカス (env 判定で psmux/WSL を分岐) ---
-            $paneId = $info.pane_id
-            $socket = $info.tmux_socket
-            $envType = if ($info.env) { $info.env } else { "psmux" }
-
             if ($paneId -and $socket) {
                 # peers 環境では各ピアが独立した psmux window として並ぶため、
                 # select-pane だけでは window が切り替わらない。
                 # psmux は select-window -t @N (window_id形式) を受け付けない
                 # (数値 index として誤解釈) ため、"session_name:window_index" 形式で指定する。
-                $windowIndex = if ($info.window_index) { "$($info.window_index)".Trim() } else { "" }
-                $sessionName = if ($info.session_name) { "$($info.session_name)".Trim() } else { "" }
                 $winTarget = if ($sessionName -and $windowIndex) { "${sessionName}:${windowIndex}" } else { "" }
 
-                if ($envType -eq "wsl" -and $info.wsl_distro) {
+                if ($envType -eq "wsl" -and $wslDistro) {
                     # WSL: session:index で select-window してから select-pane
                     if ($winTarget) {
-                        & wsl -d $info.wsl_distro -- tmux -S $socket select-window -t $winTarget 2>&1 | Out-Null
+                        & wsl -d $wslDistro -- tmux -S $socket select-window -t $winTarget 2>&1 | Out-Null
                     }
-                    $r = & wsl -d $info.wsl_distro -- tmux -S $socket select-pane -t $paneId 2>&1
-                    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] WSL select-window=$winTarget pane=$paneId distro=$($info.wsl_distro) socket=$socket exit=$LASTEXITCODE" |
+                    $r = & wsl -d $wslDistro -- tmux -S $socket select-pane -t $paneId 2>&1
+                    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [CLICK] WSL select-window=$winTarget pane=$paneId distro=$wslDistro socket=$socket exit=$LASTEXITCODE" |
                         Out-File $logPath -Append -Encoding utf8
                 } else {
                     # psmux: session:index で select-window してから select-pane
@@ -149,8 +160,8 @@ public class WinFocus {
 
             # --- Windows Terminal をフォアグラウンドに ---
             $hwnd = [IntPtr]::Zero
-            if ($info.wt_hwnd) {
-                $hwnd = [IntPtr]::new([long]$info.wt_hwnd)
+            if ($wtHwnd) {
+                $hwnd = [IntPtr]::new([long]$wtHwnd)
             } else {
                 # フォールバック: プロセス名で検索
                 $proc = Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue |
@@ -171,44 +182,75 @@ public class WinFocus {
     }
     Log "OnActivated registered"
 
-    # --- FileSystemWatcher: .last-notify.json 変更 → 通知発行 ---
-    $hooksDir = Join-Path $HOME ".claude" "hooks"
-    $watcher = [System.IO.FileSystemWatcher]::new($hooksDir, ".last-notify.json")
-    $watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite
+    # --- キューディレクトリ準備 (起動時掃除 + 作成) ---
+    $queueDir = Join-Path $HOME ".claude" "hooks" "notify-queue"
+    if (Test-Path $queueDir) {
+        Get-ChildItem $queueDir -Filter "*.json" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Log "Queue dir cleaned: $queueDir"
+    } else {
+        New-Item -ItemType Directory -Path $queueDir -Force | Out-Null
+        Log "Queue dir created: $queueDir"
+    }
 
-    $null = Register-ObjectEvent $watcher Changed -SourceIdentifier "CCFocusDaemon_FSW" -Action {
-        # FSW は LastWrite で2回発火するため、少し待ってから読む
-        Start-Sleep -Milliseconds 200
+    # --- FileSystemWatcher: notify-queue/ に新規ファイル → 通知発行 ---
+    $watcher = [System.IO.FileSystemWatcher]::new($queueDir, "*.json")
+    $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+    $watcher.IncludeSubdirectories = $false
 
+    $null = Register-ObjectEvent $watcher Created -SourceIdentifier "CCFocusDaemon_FSW" -Action {
         $logPath = Join-Path $HOME ".claude" "hooks" "focus-listener-daemon.log"
-        $notifyFile = Join-Path $HOME ".claude" "hooks" ".last-notify.json"
         $iconFile = Join-Path $HOME ".claude" "icons" "claude-ai-icon.png"
 
         try {
-            $info = Get-Content $notifyFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            $filePath = $Event.SourceEventArgs.FullPath
 
-            # 重複排除: tag が前回と同じなら無視 (LastWrite 2回発火対策)
-            if ($info.tag -eq $script:lastTag) { return }
-            $script:lastTag = $info.tag
+            # ファイル書き込み完了待ち (hook 側の cat > が終わるまで)
+            Start-Sleep -Milliseconds 50
+
+            $info = Get-Content $filePath -Raw -ErrorAction Stop | ConvertFrom-Json
 
             # 通知テキスト組み立て
             $paneLabel = ""
             if ($info.pane_id) { $paneLabel = ":$($info.pane_id)" }
             $body = "$($info.subtitle)`n$($info.project) [$($info.session_name)$paneLabel]"
 
-            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [FSW] Sending notification: tag=$($info.tag)" |
+            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [FSW] Sending notification: tag=$($info.tag) file=$($Event.SourceEventArgs.Name)" |
                 Out-File $logPath -Append -Encoding utf8
 
-            # BurntToast 通知発行
-            $toastParams = @{
-                Text             = "Claude Code", $body
-                UniqueIdentifier = $info.tag
-                Sound            = "Default"
+            # --- ToastContentBuilder で launch 引数にペイン情報を埋め込み ---
+            # クリック時に OnActivated がこの引数をパースしてフォーカス先を特定する
+            $builder = [Microsoft.Toolkit.Uwp.Notifications.ToastContentBuilder]::new()
+            $null = $builder.AddArgument("pane_id", "$($info.pane_id)")
+            $null = $builder.AddArgument("session_name", "$($info.session_name)")
+            $null = $builder.AddArgument("window_index", "$($info.window_index)")
+            $null = $builder.AddArgument("tmux_socket", "$($info.tmux_socket)")
+            $null = $builder.AddArgument("wt_hwnd", "$($info.wt_hwnd)")
+            $null = $builder.AddArgument("env", "$(if ($info.env) { $info.env } else { 'psmux' })")
+            if ($info.wsl_distro) {
+                $null = $builder.AddArgument("wsl_distro", "$($info.wsl_distro)")
             }
+            $null = $builder.AddText("Claude Code")
+            $null = $builder.AddText($body)
+
+            # アイコン設定 (AppLogoOverride)
             if (Test-Path $iconFile) {
-                $toastParams["AppLogo"] = $iconFile
+                $null = $builder.AddAppLogoOverride(
+                    [Uri]::new($iconFile),
+                    [Microsoft.Toolkit.Uwp.Notifications.ToastGenericAppLogoCrop]::Default)
             }
-            New-BurntToastNotification @toastParams
+
+            # BurntToast の Submit-BTNotification で発行 (Tag による replace セマンティクス維持)
+            # ToastContentBuilder が生成した launch 引数は ToastContent XML に埋め込まれている
+            Submit-BTNotification -Content $builder.GetToastContent() -UniqueIdentifier "$($info.tag)"
+
+            # aliveCheck 用: 最新の環境情報をグローバル変数に保存
+            $global:CCLastSocket = $info.tmux_socket
+            $global:CCLastEnv = if ($info.env) { $info.env } else { "psmux" }
+            $global:CCLastDistro = $info.wsl_distro
+
+            # キューファイル削除 (処理済み)
+            Remove-Item $filePath -Force -ErrorAction SilentlyContinue
 
         } catch {
             "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [FSW] Error: $_" |
@@ -216,14 +258,16 @@ public class WinFocus {
         }
     }
     $watcher.EnableRaisingEvents = $true
-    Log "FileSystemWatcher registered"
+    Log "FileSystemWatcher registered on $queueDir (*.json, Created)"
 
     # --- メインループ: DoEvents(COM) + Start-Sleep(PS events) ---
     Log "Entering main loop..."
     $aliveCheckCounter = 0
-    $lastSocket = $null
-    $lastEnv = $null
-    $lastDistro = $null
+
+    # aliveCheck 用グローバル変数初期化 (FSW ハンドラから更新される)
+    $global:CCLastSocket = $null
+    $global:CCLastEnv = $null
+    $global:CCLastDistro = $null
 
     while ($true) {
         # COM メッセージポンプ (OnActivated コールバック処理)
@@ -236,35 +280,23 @@ public class WinFocus {
         if ($aliveCheckCounter -ge 300) {
             $aliveCheckCounter = 0
 
-            # .last-notify.json からソケットパス・環境情報を取得 (あれば)
-            $notifyFile = Join-Path $HOME ".claude" "hooks" ".last-notify.json"
-            if (Test-Path $notifyFile) {
-                try {
-                    $info = Get-Content $notifyFile -Raw -ErrorAction SilentlyContinue |
-                            ConvertFrom-Json -ErrorAction SilentlyContinue
-                    if ($info.tmux_socket) { $lastSocket = $info.tmux_socket }
-                    if ($info.env) { $lastEnv = $info.env }
-                    if ($info.wsl_distro) { $lastDistro = $info.wsl_distro }
-                } catch { }
-            }
+            # FSW ハンドラが $global: に保存した最新の環境情報を使う
+            $lastSocket = $global:CCLastSocket
+            $lastEnv = $global:CCLastEnv
+            $lastDistro = $global:CCLastDistro
+
+            # まだ通知が1件も来ていなければスキップ
+            if (-not $lastSocket) { continue }
 
             # 環境に応じた tmux 生存確認
             $tmuxAlive = $false
             try {
                 if ($lastEnv -eq "wsl" -and $lastDistro) {
                     # WSL: wsl -d <distro> -- tmux list-sessions
-                    if ($lastSocket) {
-                        $null = & wsl -d $lastDistro -- tmux -S $lastSocket list-sessions 2>$null
-                    } else {
-                        $null = & wsl -d $lastDistro -- tmux list-sessions 2>$null
-                    }
+                    $null = & wsl -d $lastDistro -- tmux -S $lastSocket list-sessions 2>$null
                 } else {
                     # psmux: 直接 tmux コマンド
-                    if ($lastSocket) {
-                        $null = & tmux -S $lastSocket list-sessions 2>$null
-                    } else {
-                        $null = & tmux list-sessions 2>$null
-                    }
+                    $null = & tmux -S $lastSocket list-sessions 2>$null
                 }
                 $tmuxAlive = ($LASTEXITCODE -eq 0)
             } catch { }
